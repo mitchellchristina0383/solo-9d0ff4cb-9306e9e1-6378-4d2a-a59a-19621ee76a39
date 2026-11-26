@@ -34,10 +34,13 @@
                 border: 1px solid rgba(255,107,107,.4); }
   .banner small { font-weight: 400; color: var(--text); }
   label { color: var(--muted); font-size: 12px; }
-  input[type=text], input[type=number] {
+  input[type=text], input[type=number], select {
     width: 100%; background: #0c1118; color: var(--text);
     border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px;
     margin-top: 4px; }
+  input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
+  .checkline { display: flex; align-items: center; gap: 8px; padding-top: 20px; }
+  .checkline label { color: var(--text); font-size: 13px; }
   button { background: var(--accent); color: #08111d; border: 0;
            border-radius: 7px; padding: 9px 14px; font-weight: 700;
            cursor: pointer; }
@@ -84,15 +87,30 @@
     <h2>操作</h2>
     <div class="row">
       <div>
-        <label>样例备份持锁时长（秒）</label>
+        <label>样例备份持锁时长（秒，普通备份用）</label>
         <input type="number" id="duration" min="1" max="3600" step="1" value="10">
+      </div>
+      <div style="flex:1 1 220px">
+        <label>压缩样例负载（勾选左侧后生效）</label>
+        <select id="compressProfile" disabled>
+          <option value="quick">快速退出（子进程秒退，验证刷新间隙补计）</option>
+          <option value="standard" selected>标准（每个约 2 CPU 秒，可看实时增长）</option>
+          <option value="long">长负载（供中断 / 重启演练）</option>
+        </select>
+      </div>
+      <div class="checkline" style="flex:1 1 260px">
+        <input type="checkbox" id="compression" onchange="toggleProfile()">
+        <label for="compression">压缩样例：拿锁后顺序启动<b>两个压缩子进程</b>，
+          从 0 统计压缩 CPU（用户态+内核态）</label>
       </div>
       <div style="flex:0 0 auto">
         <button onclick="startBackup()">发起备份</button>
       </div>
     </div>
-    <div class="hint">备份子进程对当前锁路径做真实 fcntl.flock(LOCK_EX)，
-      持锁到设定时长结束。多个备份可同时在途，互斥等待。</div>
+    <div class="hint">普通备份子进程对当前锁路径做真实 fcntl.flock(LOCK_EX)，
+      持锁到设定时长结束；勾选<b>压缩样例</b>后，持锁期间顺序跑两个
+      <span class="mono">app.compress_child</span> 压缩本地数据，任务在两个子进程
+      计全后结束。多个备份可同时在途，互斥等待；换锁后并行的任务各算各的 CPU。</div>
     <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
     <div class="row">
       <div>
@@ -123,12 +141,13 @@
   </section>
 
   <section class="panel wide">
-    <h2>备份任务（状态由各 worker 自行落盘；running 表示正持有真实 flock）</h2>
+    <h2>备份任务（状态由各 worker 自行落盘；running 表示正持有真实 flock；压缩 CPU 为用户态+内核态合计）</h2>
     <div class="scroll">
       <table>
         <thead><tr>
           <th>任务</th><th>状态</th><th>PID</th><th>等待原因</th>
-          <th>持有的锁 inode / 代次</th><th>说明</th><th>更新时间</th>
+          <th>压缩 CPU 耗时（u+s，从 0 起）</th>
+          <th>持有的锁 inode / 代次</th><th>说明</th><th>更新时间</th><th>操作</th>
         </tr></thead>
         <tbody id="jobs"></tbody>
       </table>
@@ -188,10 +207,32 @@ async function api(url, body) {
   return data;
 }
 
+function toggleProfile() {
+  $("compressProfile").disabled = !$("compression").checked;
+}
+
 async function startBackup() {
   const d = $("duration").value;
-  const data = await api("/api/backup", {duration: d});
-  if (data.ok) toast(`已发起 ${data.job_id}（持锁 ${data.duration}s）`);
+  const compression = $("compression").checked;
+  const profile = $("compressProfile").value;
+  const data = await api("/api/backup",
+    {duration: d, compression: compression, profile: profile});
+  if (data.ok) {
+    toast(compression
+      ? `已发起压缩样例 ${data.job_id}（负载 ${data.profile}），压缩 CPU 从 0 计起`
+      : `已发起 ${data.job_id}（持锁 ${data.duration}s）`);
+  }
+  refresh();
+}
+
+async function interruptJob(jobId, force) {
+  if (!force && !confirm(
+      `确定中断任务 ${jobId}？\n压缩样例会保留最后已记录的 CPU 用量并标记为“未计全”。`)) {
+    return;
+  }
+  const data = await api(`/api/job/${encodeURIComponent(jobId)}/interrupt`,
+                         {force: !!force});
+  if (data.ok) toast(`已请求中断 ${jobId}（${data.signal || "取消排队"}）`);
   refresh();
 }
 async function startMaint() {
@@ -214,6 +255,44 @@ async function resume() {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"]/g,
     (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+function fmtCpu(x) { return Number(x || 0).toFixed(3); }
+
+function compCell(j) {
+  const c = j.compression;
+  const enabled = j.compression_sample === true || (c && c.sample) ||
+                  j.compression_status != null;
+  if (!enabled) return "—";
+  const cpu = (c && c.cpu_seconds != null) ? c.cpu_seconds
+            : (j.compression_cpu_seconds ?? 0);
+  const u = c ? c.user_seconds : null;
+  const sy = c ? c.system_seconds : null;
+  const done = (c && c.complete === true) || j.compression_complete === true;
+  const status = (c && c.status) || j.compression_status || "pending";
+  let badge;
+  if (done) badge = '<span class="tag done">✓ 计全</span>';
+  else if (status === "incomplete")
+    badge = '<span class="tag error">⚠ 未计全</span>';
+  else if (status === "running")
+    badge = '<span class="tag running">● 统计中</span>';
+  else badge = '<span class="tag queued">待开始</span>';
+  const detail = (u != null && sy != null)
+    ? `<div class="hint mono" style="margin:3px 0 0">` +
+      `user ${fmtCpu(u)} + kernel ${fmtCpu(sy)}<br>` +
+      `子进程 ${esc(c.children_accounted ?? 0)}/${esc(c.children_total ?? 2)}` +
+      ` · ${esc(c.profile || "")}</div>`
+    : "";
+  return `<div class="mono"><b style="font-size:13px">${fmtCpu(cpu)} s</b></div>` +
+         badge + detail;
+}
+
+function actionCell(j) {
+  if (["queued", "waiting", "running"].includes(j.state)) {
+    return `<button class="danger" style="padding:5px 10px" ` +
+           `onclick="interruptJob('${esc(j.job_id)}')">中断</button>`;
+  }
+  return "—";
 }
 
 function render(s) {
@@ -258,12 +337,14 @@ function render(s) {
       <td><span class="tag ${esc(j.state)}">${esc(j.state)}</span></td>
       <td class="mono">${esc(j.pid ?? "—")}</td>
       <td>${esc(j.wait_reason || "—")}</td>
+      <td>${compCell(j)}</td>
       <td class="mono">${j.locked_ino != null
         ? esc(j.locked_ino) + (j.locked_ino === lk.inode ? "（当前文件）" : "（旧文件）")
         : "—"}</td>
       <td>${esc(j.note || "")}</td>
       <td class="mono">${esc(j.updated_at || "")}</td>
-    </tr>`).join("") || `<tr><td colspan="7" style="color:var(--muted)">暂无任务</td></tr>`;
+      <td>${actionCell(j)}</td>
+    </tr>`).join("") || `<tr><td colspan="9" style="color:var(--muted)">暂无任务</td></tr>`;
 
   $("plocks").innerHTML = s.proc_locks.map((r) => `
     <tr>

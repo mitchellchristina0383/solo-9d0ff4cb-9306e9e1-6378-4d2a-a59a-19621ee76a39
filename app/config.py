@@ -23,6 +23,8 @@ MAX_INFLIGHT = int(os.environ.get("BM_MAX_INFLIGHT", "6"))
 TICK_INTERVAL = float(os.environ.get("BM_TICK_INTERVAL", "0.3"))
 # 取锁等待时的重试间隔（秒）
 LOCK_RETRY_INTERVAL = float(os.environ.get("BM_LOCK_RETRY_INTERVAL", "0.25"))
+# 压缩子进程 CPU 实时采样/状态落盘间隔（秒）
+COMPRESS_POLL_INTERVAL = float(os.environ.get("BM_COMPRESS_POLL_INTERVAL", "0.2"))
 
 for _d in (DATA_DIR, STATE_DIR, LOCK_DIR):
     os.makedirs(_d, exist_ok=True)

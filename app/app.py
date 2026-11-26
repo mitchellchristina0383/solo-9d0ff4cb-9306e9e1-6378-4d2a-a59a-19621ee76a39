@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -32,6 +33,7 @@ from .common import (
     read_maintenance,
     write_maintenance,
 )
+from .compression import CompressionMeter, incomplete_view
 
 TERMINAL_STATES = {"done", "error"}
 LIVE_STATES = {"queued", "waiting", "running"}
@@ -52,6 +54,32 @@ def pid_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True
+    return True
+
+
+def finalize_compression(job: dict, reason: str) -> bool:
+    """任务进程已不在、但压缩账未记全时：保留最后数值并标“未计全”。
+
+    原地修改 job；返回是否改动了 compression 字段。绝不清零
+    cpu_seconds，保证意外中断/容器重启后仍查得到最后已记录用量。
+    """
+    comp = job.get("compression")
+    is_sample = ((isinstance(comp, dict) and comp.get("sample"))
+                 or job.get("compression_sample") is True)
+    if not is_sample:
+        return False
+    if isinstance(comp, dict) and comp.get("complete"):
+        return False
+    view = incomplete_view(comp if isinstance(comp, dict) else None, reason)
+    job["compression"] = view
+    job["compression_sample"] = True
+    cpu = view.get("cpu_seconds", 0.0) or 0.0
+    job["compression_cpu_seconds"] = cpu
+    job["compression_cpu_time_seconds"] = cpu
+    job["compression_complete"] = False
+    job["compression_fully_counted"] = False
+    job["compression_status"] = "incomplete"
+    job["compression_count_label"] = "未计全"
     return True
 
 
@@ -191,6 +219,8 @@ class Console:
             if state in LIVE_STATES and not pid_alive(job.get("pid")):
                 job["state"] = "error"
                 job["note"] = (job.get("note") or "") + "；服务重启时进程已不存在"
+                if finalize_compression(job, "容器/服务重启，压缩未正常计全"):
+                    job["note"] += "；压缩 CPU 用量保留最后记录值，标记为未计全"
                 job["updated_at"] = now_str()
                 atomic_write_json(self._state_path(job["job_id"]), job)
                 self.log_event("job", f"{job['job_id']} 重启回收：进程不存在，标记失败")
@@ -210,8 +240,17 @@ class Console:
             if job and job.get("state") in LIVE_STATES:
                 job["state"] = "done" if rc == 0 else "error"
                 job["note"] = (job.get("note") or "") + f"；进程退出码 {rc}"
+                if finalize_compression(job, f"worker 已退出(rc={rc})，压缩账未计全"):
+                    job["note"] += "；已保留最后压缩 CPU 用量并标记未计全"
                 job["updated_at"] = now_str()
                 atomic_write_json(self._state_path(job_id), job)
+            elif job is not None:
+                # worker 已自行写终态（正常 done / 信号 error）。
+                # 仅兜底：若终态里 compression 仍标着未完成，补一次标记，
+                # 但不覆盖 worker 已写好的“未计全”语义。
+                if finalize_compression(job, f"worker 已退出(rc={rc})，压缩账未计全"):
+                    job["updated_at"] = now_str()
+                    atomic_write_json(self._state_path(job_id), job)
             self.log_event("job", f"{job_id} 进程结束 (exit={rc})")
         # 兜底：worker 已派发(pid 非空)但进程不在登记表里（如服务被 kill 重启）。
         # 注意 queued 任务 pid=None，属于尚未派发，绝不能在这里判死。
@@ -222,34 +261,48 @@ class Console:
                     and not pid_alive(pid)):
                 job["state"] = "error"
                 job["note"] = (job.get("note") or "") + "；进程已消失"
+                if finalize_compression(job, "worker 进程已消失，压缩账未计全"):
+                    job["note"] += "；已保留最后压缩 CPU 用量并标记未计全"
                 job["updated_at"] = now_str()
                 atomic_write_json(self._state_path(job["job_id"]), job)
 
-    def _spawn_locked(self, job_id: str, duration: float) -> None:
+    def _spawn_locked(self, job_id: str, duration: float,
+                      compression: bool = False,
+                      profile: str = "standard") -> None:
         log_fd = open(WORKER_LOG, "a", encoding="utf-8")
+        cmd = [
+            sys.executable, "-m", "app.worker",
+            "--job-id", job_id,
+            "--duration", str(duration),
+        ]
+        if compression:
+            cmd += ["--compression-sample", "--compress-profile", profile]
         proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "app.worker",
-                "--job-id", job_id,
-                "--duration", str(duration),
-            ],
+            cmd,
             cwd=str(PACKAGE_ROOT),
             stdin=subprocess.DEVNULL,
             stdout=log_fd,
             stderr=log_fd,
             close_fds=True,
+            # worker 成为独立进程组组长；“中断任务”时 killpg 可连同
+            # 它顺序启动的压缩子进程一起终止。
+            start_new_session=True,
         )
         self.procs[job_id] = proc
-        self.log_event("dispatch", f"派发 {job_id} (pid={proc.pid}, 时长={duration}s)")
+        kind = f"压缩样例({profile})" if compression else "普通备份"
+        self.log_event("dispatch",
+                       f"派发 {job_id} (pid={proc.pid}, 时长={duration}s, {kind})")
 
     def enqueue_backup(self, duration: float | None = None,
-                       source: str = "手动") -> dict:
+                       source: str = "手动",
+                       compression: bool = False,
+                       profile: str = "standard") -> dict:
         with self.lock:
             self._job_seq += 1
             job_id = (f"job-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                       f"-{self._job_seq:03d}")
             duration = float(config.DEFAULT_DURATION if duration is None else duration)
-            atomic_write_json(self._state_path(job_id), {
+            job: dict = {
                 "job_id": job_id,
                 "pid": None,
                 "state": "queued",
@@ -258,12 +311,89 @@ class Console:
                 "locked_ino": None,
                 "locked_dev": None,
                 "locked_path": None,
-                "note": f"{source}发起，排队等待调度",
+                "compression_sample": bool(compression),
+                "note": (f"{source}发起，排队等待调度"
+                         + ("（压缩 CPU 样例：取锁后顺序跑两个压缩子进程）"
+                            if compression else "")),
                 "updated_at": now_str(),
-            })
+            }
+            if compression:
+                # 入队即建立从 0 开始的压缩 CPU 账，任务表立刻可见
+                meter = CompressionMeter(profile)
+                job["compression"] = meter.to_dict()
+                job.update(meter.top_level())
+            atomic_write_json(self._state_path(job_id), job)
             self.queue.append(job_id)
-            self.log_event("job", f"{source}发起备份 {job_id}，持锁时长 {duration}s")
-            return {"job_id": job_id, "duration": duration}
+            self.log_event("job",
+                           f"{source}发起{'压缩样例' if compression else '备份'} "
+                           f"{job_id}，持锁时长 {duration}s"
+                           + (f"，负载档={profile}" if compression else ""))
+            return {"job_id": job_id, "duration": duration,
+                    "compression": compression, "profile": profile}
+
+    # ------------------------------------------------------------------ #
+    # 手动中断（压缩样例 / 任意在途任务）
+    # ------------------------------------------------------------------ #
+    def interrupt_job(self, job_id: str, force: bool = False) -> tuple[dict, int]:
+        """终止一笔任务。
+
+        * 排队中(pid=None)：移出队列并直接判 error，压缩账保持 0/未计全；
+        * 已派发：优先 killpg 整个 worker 进程组（连同压缩子进程），
+          SIGTERM 时 worker 会保留最后用量并写“未计全”；
+          force=True 发 SIGKILL，由调度/快照收割路径做同样的保留标记。
+        """
+        with self.lock:
+            job = self._load_job(job_id)
+            if not job:
+                return {"ok": False, "reason": f"任务不存在：{job_id}"}, 404
+
+            if job.get("state") in TERMINAL_STATES:
+                return {"ok": False,
+                        "reason": f"任务已处于终态 {job.get('state')}，无需中断"}, 409
+
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            pid = job.get("pid")
+
+            if not pid:
+                # 尚在队列、从未派发
+                try:
+                    self.queue.remove(job_id)
+                except ValueError:
+                    pass
+                job["state"] = "error"
+                job["wait_reason"] = None
+                job["note"] = (job.get("note") or "") + "；网页手动中断（尚在排队，未派发）"
+                if finalize_compression(job, "排队中被取消，压缩未执行/未计全"):
+                    job["note"] += "；压缩账标记未计全"
+                job["updated_at"] = now_str()
+                atomic_write_json(self._state_path(job_id), job)
+                self.log_event("job", f"{job_id} 排队中被手动取消")
+                return {"ok": True, "job_id": job_id, "dispatched": False}, 200
+
+            sig_name = "SIGKILL" if force else "SIGTERM"
+            delivered = False
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, sig)
+                delivered = True
+            except ProcessLookupError:
+                pass
+            except OSError:
+                try:
+                    os.kill(pid, sig)
+                    delivered = True
+                except ProcessLookupError:
+                    pass
+            if not delivered:
+                # 进程已经不在：立刻走一次收割落标记
+                self._reap_locked()
+                self.log_event("job", f"{job_id} 中断时进程 {pid} 已不存在，已收割")
+                return {"ok": True, "job_id": job_id, "pid": pid,
+                        "already_gone": True}, 200
+            self.log_event("job",
+                           f"手动中断 {job_id} pid={pid}，已向进程组发 {sig_name}")
+            return {"ok": True, "job_id": job_id, "pid": pid,
+                    "signal": sig_name}, 200
 
     # ------------------------------------------------------------------ #
     # 检修闸门与恢复核验
@@ -405,7 +535,17 @@ class Console:
                     job = self._load_job(job_id)
                     if not job:
                         continue
-                    self._spawn_locked(job_id, float(job["duration"]))
+                    comp = job.get("compression")
+                    is_sample = bool(
+                        job.get("compression_sample")
+                        or (isinstance(comp, dict) and comp.get("sample"))
+                    )
+                    profile = "standard"
+                    if isinstance(comp, dict) and comp.get("profile"):
+                        profile = str(comp["profile"])
+                    self._spawn_locked(
+                        job_id, float(job["duration"]),
+                        compression=is_sample, profile=profile)
                     inflight += 1
             self._reap_locked()
 
@@ -476,7 +616,10 @@ def api_snapshot():
 
 @app.post("/api/backup")
 def api_backup():
-    payload = request.get_json(silent=True) or request.form
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        # 兼容 form 表单与 query string 发起
+        payload = request.values
     raw = payload.get("duration")
     try:
         duration = float(raw) if raw not in (None, "") else config.DEFAULT_DURATION
@@ -484,8 +627,59 @@ def api_backup():
             raise ValueError
     except (TypeError, ValueError):
         return jsonify({"ok": False, "reason": "时长需为 0~3600 秒之间的数字"}), 400
-    result = console.enqueue_backup(duration)
+
+    compression = as_bool(
+        payload.get("compression", payload.get(
+            "compression_sample", payload.get("compress",
+                                              payload.get("sample")))))
+    # 也兼容 {"type"/"kind"/"mode"/"job_type": "compression..."} 这类写法
+    quick_hint = False
+    for key in ("type", "kind", "mode", "job_type", "task_type",
+                "sample", "sample_type", "feature", "template"):
+        val = payload.get(key)
+        if isinstance(val, str):
+            low = val.strip().lower()
+            if "compress" in low or "压缩" in val:
+                compression = True
+            if "quick" in low or "fast" in low:
+                quick_hint = True
+    quick = as_bool(payload.get("quick", payload.get("fast",
+                                                    payload.get("quick_exit"))))
+    quick = quick or quick_hint
+    profile = payload.get("profile") or payload.get("compress_profile")
+    if not profile:
+        for key in ("profile_name", "load"):
+            profile = payload.get(key)
+            if profile:
+                break
+    if compression:
+        from .compression import normalize_profile
+        profile = normalize_profile("quick" if quick else profile)
+    else:
+        profile = "standard"
+    result = console.enqueue_backup(
+        duration, compression=compression, profile=profile)
     return jsonify({"ok": True, **result})
+
+
+@app.post("/api/job/<job_id>/interrupt")
+def api_job_interrupt(job_id: str):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = request.values
+    force = as_bool(payload.get("force"))
+    body, status = console.interrupt_job(job_id, force=force)
+    return jsonify(body), status
+
+
+def as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "是", "开"}
 
 
 @app.post("/api/maintenance/start")

@@ -1,2 +1,5 @@
 Flask==3.1.0
 waitress==3.0.2
+# 仅 scripts/smoke_test.py 与 scripts/compression_test.py 直连 HTTP 验证时使用；
+# 装进镜像也无副作用
+requests==2.32.3

@@ -90,6 +90,8 @@ class Harness:
 
 def start_server() -> tuple[subprocess.Popen, str, str]:
     data = tempfile.mkdtemp(prefix="bm-smoke-")
+    # 同时导出给测试进程：Harness.job 可直接读状态文件，外部换锁分支也会启用
+    os.environ["BM_DATA_DIR"] = data
     env = dict(os.environ, BM_DATA_DIR=data, BM_DEFAULT_DURATION="8",
                BM_SCHEDULE_INTERVAL="0", PORT="8091", PYTHONUNBUFFERED="1",
                BM_TICK_INTERVAL="0.1", BM_LOCK_RETRY_INTERVAL="0.1")
@@ -168,6 +170,40 @@ def test_dual_locks(h: Harness) -> None:
     print("场景 A：PASS")
 
 
+def wait_resume_ok(h: Harness, timeout: float = 20.0) -> dict:
+    """重试“核验并恢复”直到通过。
+
+    worker 先把 state 写成 done，几毫秒后才在 finally 里释放 flock；
+    第一次核验可能恰好撞上这个窗口而被拒，重试到内核锁真正释放即可。
+    这不是放松核验——核验不通过时接口仍会如实返回 ok=False。
+    """
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = h.post("/api/maintenance/resume")
+        if last.get("ok"):
+            return last
+        time.sleep(0.4)
+    raise Fail(f"核验放行在 {timeout}s 内一直未通过：{last}")
+
+
+def wait_holder(h: Harness, ids: list[str], timeout: float = 15.0
+                ) -> tuple[str, list[str]]:
+    """flock(LOCK_NB 轮询) 不保证 FIFO：从一批任务里找出唯一持锁者与等待者。"""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        states = {jid: h.job(jid) for jid in ids}
+        last = {jid: j.get("state") for jid, j in states.items()}
+        if all(j.get("pid") for j in states.values()):
+            running = [j for j in ids if states[j]["state"] == "running"]
+            waiting = [j for j in ids if states[j]["state"] == "waiting"]
+            if len(running) == 1 and len(waiting) == len(ids) - 1:
+                return running[0], waiting
+        time.sleep(0.2)
+    raise Fail(f"未能确定唯一持锁者/等待者，最后状态={last}")
+
+
 def test_maintenance(h: Harness) -> None:
     print("\n=== 场景 B：检修停派、等待任务不抢跑、检修中再次换锁与重新核验 ===")
     ino_v1 = h.snap()["lock"]["inode"]
@@ -206,47 +242,46 @@ def test_maintenance(h: Harness) -> None:
     # 不杀进程，等 j1 自行结束
     h.wait_job(j1, "done", timeout=20)
 
-    # j1 结束后核验通过，队列恢复派发：j2 立即持锁，j3 进入取锁等待
-    res = h.post("/api/maintenance/resume")
-    must(res["ok"], f"旧锁释放后核验应通过，实际：{res}")
+    # j1 结束后核验通过，队列恢复派发。done 状态文件可能略早于 flock
+    # 内核释放，用 wait_resume_ok 跨过这个无害微窗口。
+    res = wait_resume_ok(h, timeout=20)
+    must(h.snap()["maintenance"]["active"] is False, "放行后检修标志应清除")
     print(f"[5] j1 自行结束，核验通过恢复派发：{res['reason']}")
-    # j2 是队列头，恢复后应在秒级拿到锁；给 30s 余量防宿主机抖动
-    h.wait_job(j2, "running", timeout=30)
-    # j3 在 resume 前已被 spawn 成等待进程（在途上限内），锁释放后它要么
-    # 仍在 waiting（j2 先抢到），要么已经 running；两种都合法，只要别是 queued
-    j3_state = h.job(j3)["state"]
-    must(j3_state in ("waiting", "running"),
-         f"恢复后 j3 应已派发并参与取锁，实际 {j3_state}")
-    if j3_state == "waiting":
-        h.wait_job(j3, "waiting", timeout=10)  # 确认它稳定处于等待
 
-    # j3 正在取锁路上时再次停派：worker 闸门必须把它拦回 waiting/maintenance
+    # j2/j3/j4 在同一个 tick 被派发；flock 非阻塞轮询不保证 FIFO，
+    # 谁先抢到锁都合法。确定唯一持锁者 holder 与两个取锁等待者 waiters。
+    ids = [j2, j3, j4]
+    holder, waiters = wait_holder(h, ids, timeout=15)
+    must(h.job(holder)["locked_ino"] == ino_v1,
+         f"恢复后持锁者 {holder} 应锁初始 inode={ino_v1}，"
+         f"实际 {h.job(holder).get('locked_ino')}")
+    print(f"[5a] {holder} 抢到锁(inode={ino_v1})，等待者={waiters}（不要求 FIFO）")
+
+    # 持锁者正在运行时再次停派：两个取锁路上的 worker 都必须被闸门拦回
+    # waiting/maintenance，且除原持锁者外不得新增 running。
     must(h.post("/api/maintenance/start", reason="第二次检修，验证 worker 闸门")["ok"],
          "再次开始检修应成功")
     deadline = time.monotonic() + 8
     blocked = False
     while time.monotonic() < deadline:
-        st = h.job(j3)
-        if st["state"] == "waiting" and st.get("wait_reason") == "maintenance":
+        if all(h.job(w).get("state") == "waiting"
+               and h.job(w).get("wait_reason") == "maintenance"
+               for w in waiters):
             blocked = True
             break
-        time.sleep(0.4)
-    must(blocked, "取锁等待中的 worker 在检修后必须被闸门拦回 waiting/maintenance")
-    time.sleep(2)
-    j3_now = h.job(j3)
-    must(j3_now["state"] == "waiting", "闸门期间 j3 不得变为 running")
-    # 调度器可能已把队列里的 j4 也 spawn 成等待进程；无论哪种形态，
-    # 它都绝不能进入 running，且只要是 waiting 就必须被闸门挡住
-    j4_now = h.job(j4)
-    must(j4_now["state"] in ("queued", "waiting"),
-         f"闸门期间 j4 不得 running，实际 {j4_now['state']}")
-    if j4_now["state"] == "waiting":
-        must(j4_now["wait_reason"] == "maintenance",
-             "j4 若已在等待，原因必须是 maintenance 闸门")
-    else:
-        must(j4_now["pid"] is None, "j4 若仍 queued 则不应有 PID")
-    print(f"[6] {j3}/{j4} 均被闸门拦截（未抢跑），状态="
-          f"{j3_now['state']}/{j4_now['state']}")
+        time.sleep(0.3)
+    must(blocked, "所有取锁等待中的 worker 在检修后必须被闸门拦回 waiting/maintenance")
+    time.sleep(1.5)
+    running_now = [j for j in ids if h.job(j)["state"] == "running"]
+    must(set(running_now) == {holder},
+         f"闸门期间只能有原持锁者 {holder} running，实际 {running_now}")
+    for w in waiters:
+        wj = h.job(w)
+        must(wj["state"] == "waiting" and wj.get("wait_reason") == "maintenance",
+             f"{w} 必须稳定停在 waiting/maintenance，"
+             f"实际 {wj['state']}/{wj.get('wait_reason')}")
+    print(f"[6] 等待者 {waiters} 均被闸门拦截（未抢跑），"
+          f"持锁者 {holder} 继续运行")
 
     # 检修期间连续两次换锁（v2 -> v3），放行前必须按最新文件重新核验
     ino_v2 = h.post("/api/lock/replace", note="检修中第一次换锁 v2")["inode"]
@@ -254,9 +289,9 @@ def test_maintenance(h: Harness) -> None:
     must(len({ino_v1, ino_v2, ino_v3}) == 3, "三次锁文件 inode 应互不相同")
     must(h.snap()["lock"]["inode"] == ino_v3, "当前文件应为最新一代 v3")
     print(f"[7] 检修期间两次换锁：v2={ino_v2} -> v3={ino_v3}（当前）")
-    # 此时 j2 仍持旧锁（v1 的 inode），核验必须继续报“持锁任务未结束”
+    # 此时 holder 仍持旧锁（v1 的 inode），核验必须继续报“持锁任务未结束”
     res = h.post("/api/maintenance/resume")
-    must(res["ok"] is False, "j2 仍持旧锁时核验应失败")
+    must(res["ok"] is False, "持锁者仍持旧锁时核验应失败")
     must(h.snap()["maintenance"]["active"] is True, "失败后保持停派")
     print(f"[7a] 旧锁未全释放，核验拒绝：{res['reason']}")
 
@@ -276,35 +311,37 @@ def test_maintenance(h: Harness) -> None:
     else:
         ino_v4 = ino_v3
 
-    # 等 j2 自行结束，旧锁（v1 inode）才真正全数释放
-    h.wait_job(j2, "done", timeout=30)
+    # 等持锁者自行结束，旧锁（v1 inode）才真正全数释放
+    h.wait_job(holder, "done", timeout=45)
 
-    # 全部旧锁已释放，按最新文件试探取锁成功，才放行
-    res = h.post("/api/maintenance/resume")
-    must(res["ok"], f"按最新文件核验应通过，实际：{res}")
+    # 全部旧锁已释放，按最新文件试探取锁成功，才放行（跨过 flock 释放微窗口）
+    res = wait_resume_ok(h, timeout=20)
     must(h.snap()["maintenance"]["active"] is False, "放行后检修标志应清除")
     print(f"[9] 按最新文件(inode={ino_v4})核验通过，恢复派发：{res['reason']}")
 
-    # 放行后任务串行取锁（j3 先、j4 后），按最长链路给超时
-    h.wait_job(j3, "running", timeout=30)
-    must(h.job(j3)["locked_ino"] == ino_v4, "j3 放行后必须锁最新一代文件")
-    # j4 排在队尾，观测窗口内可能已跑完；running/done 都接受，
-    # 但都必须是锁着最新文件
-    deadline = time.monotonic() + 35
-    j4_final = None
-    while time.monotonic() < deadline:
-        st = h.job(j4)
-        if st["state"] in ("running", "done"):
-            j4_final = st
-            break
-        time.sleep(0.3)
-    must(j4_final is not None, f"j4 未在窗口内开跑，实际 {h.job(j4)}")
-    must(j4_final["locked_ino"] == ino_v4,
-         f"j4 必须锁最新一代文件，实际 locked_ino={j4_final.get('locked_ino')}")
-    print(f"[10] 放行后 {j3}/{j4} 先后开跑，均锁最新 inode={ino_v4}")
+    # 两个等待者放行后串行取锁；不规定先后，只要求都锁最新一代文件并 done
+    deadline = time.monotonic() + 85
+    finals: dict[str, dict] = {}
+    while time.monotonic() < deadline and len(finals) < len(waiters):
+        for w in waiters:
+            if w in finals:
+                continue
+            wj = h.job(w)
+            if wj["state"] == "done":
+                finals[w] = wj
+            elif wj["state"] == "error":
+                raise Fail(f"{w} 不应 error：{wj.get('note')}")
+        if len(finals) < len(waiters):
+            time.sleep(0.4)
+    missing = [w for w in waiters if w not in finals]
+    must(not missing,
+         f"等待任务 {missing} 未在窗口内 done，实际 "
+         f"{[(w, h.job(w)['state']) for w in missing]}")
+    for w, wj in finals.items():
+        must(wj["locked_ino"] == ino_v4,
+             f"{w} 放行后必须锁最新 inode={ino_v4}，实际 {wj.get('locked_ino')}")
+    print(f"[10] 放行后等待者 {waiters} 先后跑完，均锁最新 inode={ino_v4}")
 
-    h.wait_job(j3, "done", timeout=30)
-    h.wait_job(j4, "done", timeout=30)
     wait_for(lambda: h.snap() if not h.snap()["proc_locks"] else None,
              "收尾 FLOCK 清空", timeout=30)
     print("场景 B：PASS")
