@@ -1,0 +1,21 @@
+services:
+  backup-maintenance:
+    build: .
+    image: backup-lock-maintenance:latest
+    container_name: backup-lock-maintenance
+    ports:
+      - "8080:8080"
+    environment:
+      # 样例备份默认持锁秒数（网页每次发起时可覆盖）
+      BM_DEFAULT_DURATION: "10"
+      # 定时备份间隔秒数；0 = 关闭定时，仅网页手动发起
+      BM_SCHEDULE_INTERVAL: "0"
+      # 同时在途（排队/持锁）任务上限
+      BM_MAX_INFLIGHT: "6"
+      PORT: "8080"
+    volumes:
+      - backup_data:/data
+    restart: unless-stopped
+
+volumes:
+  backup_data:
